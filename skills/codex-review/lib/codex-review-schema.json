@@ -1,0 +1,75 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "findings", "verified", "remainingRisks"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "レビュー全体の要約。3行以内。"
+    },
+    "findings": {
+      "type": "array",
+      "description": "指摘一覧。指摘がない場合は空配列。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "severity",
+          "title",
+          "location",
+          "detail",
+          "evidence",
+          "proposedFix",
+          "confidence"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "指摘の識別子。F1, F2 のような連番。"
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["blocker", "non-blocker"],
+            "description": "blocker は merge 前に必ず修正すべき問題。non-blocker は改善提案。"
+          },
+          "title": {
+            "type": "string",
+            "description": "指摘の一行要約。"
+          },
+          "location": {
+            "type": "string",
+            "description": "path/to/file.ts:123 形式。行が特定できない場合はファイルパスのみ。"
+          },
+          "detail": {
+            "type": "string",
+            "description": "何が問題か、どう壊れるかを具体的に記述する。"
+          },
+          "evidence": {
+            "type": "string",
+            "description": "実際に読んだコード・設計書の該当箇所の引用または要約。推測は書かない。"
+          },
+          "proposedFix": {
+            "type": "string",
+            "description": "具体的な修正方針。差分そのものは不要。"
+          },
+          "confidence": {
+            "type": "string",
+            "enum": ["high", "medium", "low"],
+            "description": "確信度。裏取りできていない指摘は low にする。"
+          }
+        }
+      }
+    },
+    "verified": {
+      "type": "array",
+      "description": "実際に確認した内容（変更前実挙動、設計書との照合、テスト、lint など）。",
+      "items": { "type": "string" }
+    },
+    "remainingRisks": {
+      "type": "array",
+      "description": "未確認事項、前提、レビュー範囲外。",
+      "items": { "type": "string" }
+    }
+  }
+}

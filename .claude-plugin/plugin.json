@@ -1,0 +1,6 @@
+{
+  "name": "codex-review",
+  "version": "1.0.0",
+  "description": "未レビューのコミットを Codex CLI に read-only でレビューさせ、各指摘を実コードで検証して修正案を提示するスキル",
+  "keywords": ["code-review", "codex", "git", "review"]
+}

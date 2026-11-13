@@ -1,0 +1,781 @@
+#!/usr/bin/env bash
+#
+# codex-review - ベースブランチから分岐したあとのコミットを Codex にレビューさせる。
+#
+# 対象は「ベースとの差分にある全コミット」から「レビュー済みとして記録済みの SHA」を
+# 引いたもの。範囲を絞る引数は用意しない。途中だけ未レビューで残る状態を作れると、
+# レビュー漏れを防ぐという目的と矛盾するため。
+#
+# Codex は read-only サンドボックスで起動し、指摘のみを行う（修正は呼び出し側の
+# エージェントが、ユーザーの承認後に行う）。
+#
+# 使い方:
+#   codex-review                  # ベースとの差分のうち未レビュー分をレビューする
+#   codex-review --base main      # 比較するベースブランチを変える
+#   codex-review --dirty          # 未コミットの作業ツリー差分も含める
+#   codex-review --dry-run        # 依頼ファイルの生成だけ行い Codex は起動しない
+#   codex-review --force          # レビュー済みのコミットも再レビューする
+#   codex-review --status         # 記録済みコミットの一覧を表示して終了
+#   codex-review --complete <sha>.. # 提示済みのコミットをレビュー済みにして終了
+#   codex-review --model <name>   # Codex のモデルを指定する
+#   codex-review --effort <level> # 推論強度 (none|minimal|low|medium|high|xhigh)
+#   codex-review --lang <lang>    # 出力言語 (既定 ja。環境変数 CODEX_REVIEW_LANG でも可)
+#   codex-review --reset-defaults # 記憶したモデル・推論強度を消して終了
+#
+# ベースブランチの決め方 (上から優先):
+#   --base <ref> > 環境変数 CODEX_REVIEW_BASE > git config codex-review.base
+#   > origin/HEAD が指すブランチ > origin/main > origin/master > main > master
+#
+# プロジェクト固有のレビュー基準は、リポジトリ直下の .codex-review.md に書く
+# (場所は git config codex-review.guide / 環境変数 CODEX_REVIEW_GUIDE で変更可)。
+#
+# --model / --effort は、レビューが成功した時点で既定値として記憶し、
+# 次回以降は指定を省略できる。失敗した実行では記憶しない
+# (起動できないモデルを既定にすると、以降のレビューが黙って全部失敗するため)。
+#
+# レビュー済みの記録は --complete <sha>... で行う。Codex が成功しただけでは記録しない。
+# 指摘をユーザーへ提示し終えてから記録するので、提示前に中断された場合は何も記録されず、
+# そのコミットは次回また対象になる (レビュー漏れにならない)。
+#
+# 生成物と記録は .git/codex-review/ に置く (コミットされない・.gitignore 不要)。
+
+set -euo pipefail
+
+# シンボリックリンク (例: ~/.local/bin/codex-review) 経由で起動されても、
+# 同梱の lib/ を見つけられるよう実体のパスを解決する。
+resolve_path() {
+  local p="$1" target
+  while [[ -L "$p" ]]; do
+    target="$(readlink "$p")"
+    if [[ "$target" == /* ]]; then
+      p="$target"
+    else
+      p="$(dirname "$p")/$target"
+    fi
+  done
+  printf '%s/%s\n' "$(cd "$(dirname "$p")" && pwd -P)" "$(basename "$p")"
+}
+
+SELF_PATH="$(resolve_path "${BASH_SOURCE[0]}")"
+SKILL_DIR="$(dirname "$(dirname "$SELF_PATH")")"
+LIB_DIR="$SKILL_DIR/lib"
+SCHEMA_PATH="$LIB_DIR/codex-review-schema.json"
+STATE_SCRIPT="$LIB_DIR/codex_review_state.py"
+
+# 案内に表示するコマンド名。PATH 上の codex-review が自分自身ならその名前で、
+# そうでなければ実体のパスで案内する (案内どおりに実行して動くことを優先)。
+SELF_CMD="$(printf '%q' "$SELF_PATH")"
+if on_path="$(command -v codex-review 2>/dev/null)" \
+  && [[ "$(resolve_path "$on_path")" == "$SELF_PATH" ]]; then
+  SELF_CMD="codex-review"
+fi
+
+MAX_DIFF_BYTES="${CODEX_REVIEW_MAX_DIFF_BYTES:-400000}"
+LANG_OUT="${CODEX_REVIEW_LANG:-ja}"
+
+BASE_ARG=""
+INCLUDE_DIRTY=0
+DRY_RUN=0
+FORCE=0
+SHOW_STATUS=0
+MARK_COMPLETE=0
+RESET_DEFAULTS=0
+COMPLETE_SHAS=()
+# --complete へ引き継ぐ指摘件数。--status の表示に使う (スクリプトが自分で埋める)。
+RECORD_FINDINGS=""
+RECORD_BLOCKERS=""
+MODEL=""
+EFFORT=""
+
+usage() {
+  # 先頭のコメントブロックをそのまま使い方として表示する。
+  awk 'NR < 3 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$SELF_PATH"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base)   BASE_ARG="${2:-}"; shift 2 ;;
+    --dirty)  INCLUDE_DIRTY=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --force)  FORCE=1; shift ;;
+    --status) SHOW_STATUS=1; shift ;;
+    --complete) MARK_COMPLETE=1; shift ;;
+    --reset-defaults) RESET_DEFAULTS=1; shift ;;
+    --findings) RECORD_FINDINGS="${2:-}"; shift 2 ;;
+    --blockers) RECORD_BLOCKERS="${2:-}"; shift 2 ;;
+    --lang)   LANG_OUT="${2:-ja}"; shift 2 ;;
+    --model)  MODEL="${2:-}"; shift 2 ;;
+    --effort) EFFORT="${2:-}"; shift 2 ;;
+    --max-diff-bytes) MAX_DIFF_BYTES="${2:-}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "不明な引数: $1" >&2; usage >&2; exit 1 ;;
+    # --complete に渡すコミット SHA。それ以外の位置引数は受け付けない。
+    *) COMPLETE_SHAS+=("$1"); shift ;;
+  esac
+done
+
+[[ -f "$SCHEMA_PATH" ]] || { echo "スキーマが見つかりません: $SCHEMA_PATH" >&2; exit 1; }
+[[ -f "$STATE_SCRIPT" ]] || { echo "状態管理スクリプトが見つかりません: $STATE_SCRIPT" >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "python3 が見つかりません。" >&2; exit 1; }
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "git リポジトリの中で実行してください。" >&2
+  exit 1
+}
+cd "$ROOT"
+
+# 生成物 (依頼・結果・ログ) は作業ツリーごと、記録 (レビュー済み・モデルの記憶) は
+# リポジトリ共通に置く。SHA はワークツリー間で共通なので、別ワークツリーで
+# レビュー済みにしたコミットを再レビューしないよう記録は共有する。
+# いずれも .git の中なのでコミットされず、対象リポジトリに .gitignore を足す必要がない。
+GIT_DIR_ABS="$(git rev-parse --absolute-git-dir)"
+GIT_COMMON_ABS="$(git rev-parse --path-format=absolute --git-common-dir)"
+WORK_DIR="${CODEX_REVIEW_WORK_DIR:-$GIT_DIR_ABS/codex-review}"
+STATE_DIR="${CODEX_REVIEW_STATE_DIR:-$GIT_COMMON_ABS/codex-review}"
+REQUEST_PATH="${CODEX_REVIEW_REQUEST_PATH:-$WORK_DIR/request.md}"
+PROMPT_PATH="${CODEX_REVIEW_PROMPT_PATH:-$WORK_DIR/prompt.md}"
+RESULT_PATH="${CODEX_REVIEW_RESULT_PATH:-$WORK_DIR/result.json}"
+LOG_PATH="${CODEX_REVIEW_LOG_PATH:-$WORK_DIR/raw.log}"
+STATE_PATH="${CODEX_REVIEW_STATE_PATH:-$STATE_DIR/state.json}"
+# モデル・推論強度の記憶。レビュー記録とは別ファイルにする。
+# 状態ファイルを消してもモデルの好みまで失わないようにするため。
+PREFS_PATH="${CODEX_REVIEW_PREFS_PATH:-$STATE_DIR/prefs.json}"
+
+# プロジェクト固有のレビュー基準。存在すれば Codex に最優先で読ませる。
+GUIDE_PATH="${CODEX_REVIEW_GUIDE:-}"
+[[ -z "$GUIDE_PATH" ]] && GUIDE_PATH="$(git config --get codex-review.guide 2>/dev/null || true)"
+[[ -z "$GUIDE_PATH" ]] && GUIDE_PATH=".codex-review.md"
+
+# 記録のメタ情報として残すセッション ID。記録の鍵ではない (鍵は SHA)。
+SESSION_ID="${CODEX_REVIEW_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-}}"
+
+# 記憶したモデル・推論強度を読む。壊れていれば無視して既定に戻す
+# (壊れた記憶で以降のレビューが全部失敗するより、既定へ倒す方が安全)。
+read_pref() {
+  local key="$1"
+  [[ -f "$PREFS_PATH" ]] || return 0
+  python3 - "$PREFS_PATH" "$key" <<'PREF_EOF' 2>/dev/null || true
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(0)
+if isinstance(data, dict):
+    value = data.get(sys.argv[2])
+    if isinstance(value, str) and value:
+        print(value)
+PREF_EOF
+}
+
+# 今回明示された値だけを記憶する。指定しなかった項目は既存の記憶を保つ。
+save_prefs() {
+  local model="$1" effort="$2"
+  [[ -z "$model" && -z "$effort" ]] && return 0
+  mkdir -p "$(dirname "$PREFS_PATH")"
+  python3 - "$PREFS_PATH" "$model" "$effort" <<'PREF_EOF'
+import datetime, json, os, sys, tempfile
+
+path, model, effort = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    prefs = json.load(open(path, encoding="utf-8"))
+    if not isinstance(prefs, dict):
+        prefs = {}
+except Exception:
+    prefs = {}
+
+if model:
+    prefs["model"] = model
+if effort:
+    prefs["effort"] = effort
+prefs["updatedAt"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+directory = os.path.dirname(path) or "."
+fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".codex-review-prefs-")
+with os.fdopen(fd, "w", encoding="utf-8") as fh:
+    json.dump(prefs, fh, ensure_ascii=False, indent=2, sort_keys=True)
+    fh.write("\n")
+os.replace(tmp_path, path)
+PREF_EOF
+}
+
+if [[ "$RESET_DEFAULTS" -eq 1 ]]; then
+  if [[ -f "$PREFS_PATH" ]]; then
+    rm -f "$PREFS_PATH"
+    echo "記憶したモデル・推論強度を消しました: $PREFS_PATH"
+    echo "以降は ~/.codex/config.toml の設定が使われます。"
+  else
+    echo "記憶しているモデル・推論強度はありません（${PREFS_PATH}）"
+  fi
+  exit 0
+fi
+
+# 明示された指定を優先し、無ければ記憶した既定を使う。
+MODEL_SOURCE="~/.codex/config.toml"
+EFFORT_SOURCE="~/.codex/config.toml"
+if [[ -n "$MODEL" ]]; then
+  MODEL_SOURCE="今回の指定"
+else
+  MODEL="$(read_pref model)"
+  [[ -n "$MODEL" ]] && MODEL_SOURCE="前回の指定を記憶"
+fi
+if [[ -n "$EFFORT" ]]; then
+  EFFORT_SOURCE="今回の指定"
+else
+  EFFORT="$(read_pref effort)"
+  [[ -n "$EFFORT" ]] && EFFORT_SOURCE="前回の指定を記憶"
+fi
+
+if [[ "$MARK_COMPLETE" -eq 1 ]]; then
+  if [[ ${#COMPLETE_SHAS[@]} -eq 0 ]]; then
+    echo "記録するコミットを指定してください: $SELF_CMD --complete <sha>..." >&2
+    exit 1
+  fi
+  # 短縮 SHA やタグをそのまま記録すると、対象選択が使う完全 SHA と一致せず、
+  # 「記録しました」と表示しながら実際には除外されない状態になる。
+  resolved=()
+  for ref in "${COMPLETE_SHAS[@]}"; do
+    full="$(git rev-parse --verify --quiet "${ref}^{commit}")" || {
+      echo "コミットとして解決できません: $ref" >&2
+      exit 1
+    }
+    resolved+=("$full")
+  done
+  # record は「レビューを通した SHA」しか受け付けない。拒否された場合は
+  # 件数を表示せず、そのまま失敗させる (記録できたように見せない)。
+  if ! recorded="$(printf '%s\n' "${resolved[@]}" \
+    | python3 "$STATE_SCRIPT" record "$STATE_PATH" --session "$SESSION_ID" \
+        --findings "$RECORD_FINDINGS" --blockers "$RECORD_BLOCKERS")"; then
+    exit 1
+  fi
+  echo "${recorded} 件をレビュー済みとして記録しました: $STATE_PATH"
+  exit 0
+fi
+
+if [[ "$SHOW_STATUS" -eq 1 ]]; then
+  if [[ ! -f "$STATE_PATH" ]]; then
+    echo "レビュー済みのコミットはまだありません（状態ファイル: ${STATE_PATH}）"
+    exit 0
+  fi
+  echo "記憶しているモデル    : ${MODEL:-(なし)} [${MODEL_SOURCE}]"
+  echo "記憶している推論強度  : ${EFFORT:-(なし)} [${EFFORT_SOURCE}]"
+  echo
+  echo "Codex レビュー記録（状態ファイル: ${STATE_PATH}）"
+  echo "記録されているのは、指摘をユーザーへ提示し終えたコミットだけ"
+  echo
+  python3 "$STATE_SCRIPT" list "$STATE_PATH" | while IFS=$'\t' read -r sha status at findings blockers session; do
+    subject="$(git log -1 --format='%s' "$sha" 2>/dev/null || echo '(コミットが見つかりません)')"
+    printf -- '- %s  [%s]  %s  指摘%s件(blocker %s)  %s\n' \
+      "${sha:0:9}" "$status" "$at" "$findings" "$blockers" "$subject"
+  done
+  exit 0
+fi
+
+# codex CLI の有無は、差分を集める前に確認する（無駄な作業を避けるため）。
+# --dry-run は依頼ファイルを作るだけなので codex を必要としない。
+if [[ "$DRY_RUN" -eq 0 ]] && ! command -v codex >/dev/null 2>&1; then
+  cat >&2 <<EOM
+codex CLI が見つかりません。
+
+インストール方法 (npm):
+  npm install -g @openai/codex
+
+インストール後、初回のみ認証が必要です:
+  codex login
+
+codex を使わず、レビュー依頼ファイルだけを生成する場合:
+  $SELF_CMD --dry-run
+  → $REQUEST_PATH と $PROMPT_PATH が生成されます。
+     他の AI や人間のレビュー担当へそのまま渡せます。
+EOM
+  exit 127
+fi
+
+mkdir -p "$(dirname "$REQUEST_PATH")" "$(dirname "$PROMPT_PATH")" \
+  "$(dirname "$RESULT_PATH")" "$(dirname "$LOG_PATH")"
+TMPDIR_WORK="$(mktemp -d)"
+trap 'rm -rf "$TMPDIR_WORK"' EXIT
+
+# ---------------------------------------------------------------------------
+# 1. レビュー対象コミットの決定
+# ---------------------------------------------------------------------------
+
+# レビュー対象は「ベースブランチから分岐したあとの、このブランチの全コミット」。
+#
+# 「このセッションが作ったコミット」を推定する方式は、推定である以上どこまでも
+# 静かにずれる (引用の取り込み、出力を捨てたコミットの取りこぼし、
+# 書き換えで履歴から外れたコミットの混入)。
+# ベースとの差分は git が答えを持っているので、推定そのものが要らない。
+#
+# 範囲を絞る引数 (-n / --range) は置かない。途中のコミットだけ未レビューで
+# 残る状態を作れてしまい、「レビュー漏れを防ぐ」という目的と矛盾するため。
+# レビュー済みかどうかは SHA の記録だけで決める。
+CANDIDATES="$TMPDIR_WORK/candidates.txt"
+: > "$CANDIDATES"
+
+BASE_REF=""
+BASE_SOURCE=""
+if [[ -n "$BASE_ARG" ]]; then
+  BASE_REF="$BASE_ARG"; BASE_SOURCE="--base の指定"
+elif [[ -n "${CODEX_REVIEW_BASE:-}" ]]; then
+  BASE_REF="$CODEX_REVIEW_BASE"; BASE_SOURCE="環境変数 CODEX_REVIEW_BASE"
+elif cfg_base="$(git config --get codex-review.base 2>/dev/null)" && [[ -n "$cfg_base" ]]; then
+  BASE_REF="$cfg_base"; BASE_SOURCE="git config codex-review.base"
+else
+  # 自動判定。ローカルのブランチは古いことが多く、そのまま使うと取り込み済みの
+  # 上流コミットまで「未レビュー」に見えるため、リモート追跡ブランチを優先する。
+  # 現在のブランチ自身は候補から外す (自分と比べても差分は常に空になる)。
+  current_branch="$(git branch --show-current 2>/dev/null || true)"
+  auto_candidates=()
+  remote_head="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  [[ -n "$remote_head" ]] && auto_candidates+=("$remote_head")
+  auto_candidates+=(origin/main origin/master main master)
+  for candidate in "${auto_candidates[@]}"; do
+    [[ "$candidate" == "$current_branch" ]] && continue
+    if git rev-parse --verify --quiet "${candidate}^{commit}" >/dev/null; then
+      BASE_REF="$candidate"
+      BASE_SOURCE="自動判定"
+      break
+    fi
+  done
+fi
+if [[ -z "$BASE_REF" ]]; then
+  echo "ベースブランチを特定できません。次のいずれかで指定してください。" >&2
+  echo "  $SELF_CMD --base <ブランチ名>" >&2
+  echo "  git config codex-review.base <ブランチ名>   # このリポジトリの既定にする" >&2
+  exit 1
+fi
+
+if ! git rev-parse --verify --quiet "${BASE_REF}^{commit}" >/dev/null; then
+  echo "ベースブランチが見つかりません: $BASE_REF [$BASE_SOURCE]" >&2
+  echo "  $SELF_CMD --base <ブランチ名>" >&2
+  exit 1
+fi
+
+MERGE_BASE="$(git merge-base "$BASE_REF" HEAD)" || {
+  echo "$BASE_REF と HEAD の分岐点を特定できません。" >&2
+  exit 1
+}
+DETECTION="ベース ${BASE_REF} [${BASE_SOURCE}] との差分 (分岐点 $(git rev-parse --short "$MERGE_BASE"))"
+echo "ベース: ${BASE_REF} [${BASE_SOURCE}]"
+
+# マージコミットも対象に含める。競合解消は作成者が手で書いた差分であり、
+# 独立レビューの対象外にしてよい根拠がない。
+# 取り込んだ上流変更でレビューが埋もれないよう、マージの差分は
+# emit_commit_diff() が --remerge-diff (競合解消のみ) で出力する。
+git rev-list --reverse "${MERGE_BASE}..HEAD" > "$CANDIDATES"
+
+if [[ ! -s "$CANDIDATES" && "$INCLUDE_DIRTY" -eq 0 ]]; then
+  echo "${BASE_REF} と比べて、このブランチに新しいコミットはありません。" >&2
+  echo "" >&2
+  echo "未コミットの変更をレビューする場合:" >&2
+  echo "  $SELF_CMD --dirty" >&2
+  echo "別のブランチと比べる場合:" >&2
+  echo "  $SELF_CMD --base <ブランチ名>" >&2
+  exit 2
+fi
+
+COMMITS=()
+if [[ -s "$CANDIDATES" ]]; then
+  while read -r line; do
+    [[ -n "$line" ]] && COMMITS+=("$line")
+  done < "$CANDIDATES"
+fi
+
+# 既にレビュー済み（指摘を提示し終えた）のコミットを除外する（--force で無効化）。
+SKIPPED_COUNT=0
+if [[ "$FORCE" -eq 0 && ${#COMMITS[@]} -gt 0 ]]; then
+  printf '%s\n' "${COMMITS[@]}" \
+    | python3 "$STATE_SCRIPT" filter "$STATE_PATH" > "$TMPDIR_WORK/unreviewed.txt"
+  TOTAL_BEFORE=${#COMMITS[@]}
+  COMMITS=()
+  while read -r line; do
+    [[ -n "$line" ]] && COMMITS+=("$line")
+  done < "$TMPDIR_WORK/unreviewed.txt"
+  SKIPPED_COUNT=$(( TOTAL_BEFORE - ${#COMMITS[@]} ))
+fi
+
+if [[ ${#COMMITS[@]} -eq 0 && "$INCLUDE_DIRTY" -eq 0 && "$SKIPPED_COUNT" -gt 0 ]]; then
+  echo "対象コミット ${SKIPPED_COUNT} 件は、すべてレビュー済みです。" >&2
+  echo "記録の一覧: $SELF_CMD --status" >&2
+  echo "再レビューする場合: $SELF_CMD --force" >&2
+  exit 3
+fi
+
+if [[ "$SKIPPED_COUNT" -gt 0 ]]; then
+  echo "レビュー済みの ${SKIPPED_COUNT} 件を除外し、未レビューの ${#COMMITS[@]} 件をレビューします。"
+fi
+
+# ---------------------------------------------------------------------------
+# 2. 差分レンジの決定
+# ---------------------------------------------------------------------------
+
+NET_BASE=""
+NET_HEAD=""
+NET_DIFF_USABLE=0
+if [[ ${#COMMITS[@]} -gt 0 ]]; then
+  FIRST="${COMMITS[0]}"
+  NET_HEAD="${COMMITS[${#COMMITS[@]}-1]}"
+  if git rev-parse -q --verify "${FIRST}^" >/dev/null 2>&1; then
+    NET_BASE="$(git rev-parse "${FIRST}^")"
+  else
+    NET_BASE="$(git hash-object -t tree /dev/null)"
+  fi
+  # 選択コミットが親子関係で連続しているか確認する。
+  # 連続していない場合、累積差分には選択していないコミット（レビュー済みとして
+  # 除外したコミットなど）の変更まで含まれてしまう。
+  CONTIGUOUS=1
+  for (( i = 1; i < ${#COMMITS[@]}; i++ )); do
+    if [[ "$(git rev-parse -q --verify "${COMMITS[i]}^" 2>/dev/null)" != "${COMMITS[i-1]}" ]]; then
+      CONTIGUOUS=0
+      break
+    fi
+  done
+
+  # 累積差分を使えるのは、選択コミットが連続していて、かつレンジ内に
+  # マージコミット（取り込んだ上流変更）が無い場合だけ。
+  if [[ "$CONTIGUOUS" -eq 1 && -z "$(git rev-list --merges "${NET_BASE}..${NET_HEAD}" 2>/dev/null | head -1)" ]]; then
+    NET_DIFF_USABLE=1
+  fi
+fi
+
+# 大きな差分は切り詰める（Codex はリポジトリを直接読めるため補完可能）。
+is_merge_commit() {
+  [[ "$(git rev-list --parents -n 1 "$1" 2>/dev/null | wc -w)" -gt 2 ]]
+}
+
+# マージコミットの差分を、競合解消だけが見える形で書き出す。
+#
+# first-parent 差分は取り込んだ上流変更をすべて含むため、解消がその中に埋もれる。
+# --cc は「両親のいずれとも異なる hunk」しか出さないので、片側を丸ごと採用した解消
+# (結果が片方の親と一致する) が見えない。捨てた側の変更こそレビューすべき判断なので、
+# 自動マージ結果との差分を出す --remerge-diff だけを使う。
+#
+# --cc へフォールバックしてはならない。--cc の空出力は「競合解消なし」と区別できず、
+# 確認できていない競合解消を「解消なし」と記録してレビュー対象から外すことになる。
+# 取得できない場合は黙って空にせず、ここで止める。
+write_merge_diff() {
+  local sha="$1" out="$2"
+  if git show --no-ext-diff --remerge-diff --format='' "$sha" > "$out" 2>/dev/null; then
+    return
+  fi
+  cat >&2 <<EOM
+マージコミット ${sha} の競合解消差分を取得できませんでした。
+
+このコマンドは競合解消の確認に git show --remerge-diff を使います (git 2.36 以降)。
+確認できていない競合解消を「解消なし」として記録しないため、ここで中止します。
+
+対処:
+  - git を 2.36 以降へ更新する (本来の対処)
+  - 暫定回避: --base <このマージより後の ref> で、マージを範囲から外す
+    ただしそれ以前のコミットも対象外になるため、恒久的な回避策にはしない
+EOM
+  exit 1
+}
+
+# コミット1件分の差分を出力する。マージかどうかで見せ方を変える。
+emit_commit_diff() {
+  local sha="$1"
+  local out="$TMPDIR_WORK/commit.diff"
+
+  if ! is_merge_commit "$sha"; then
+    git show --no-ext-diff --format='' "$sha" > "$out" || true
+    emit_capped_diff "$out"
+    return
+  fi
+
+  write_merge_diff "$sha" "$out"
+  if [[ ! -s "$out" ]]; then
+    echo "> マージコミット。git show --remerge-diff の出力が空のため、自動マージ結果と一致しており、"
+    echo "> 手作業による競合解消は含まれません。"
+    return
+  fi
+  echo "> マージコミットの競合解消差分（自動マージ結果との差分）。取り込んだ上流変更は含みません。"
+  echo
+  emit_capped_diff "$out"
+}
+
+# コミット1件分の変更ファイル一覧を出力する。
+emit_commit_stat() {
+  local sha="$1"
+  git show --format='%h %s' --no-patch "$sha" || true
+  if is_merge_commit "$sha"; then
+    write_merge_diff "$sha" "$TMPDIR_WORK/stat.diff"
+    if [[ ! -s "$TMPDIR_WORK/stat.diff" ]]; then
+      echo " (マージコミット: 手作業による競合解消なし)"
+    else
+      git apply --stat "$TMPDIR_WORK/stat.diff" 2>/dev/null | sed '/^$/d' \
+        || echo " (マージコミット: 競合解消あり)"
+    fi
+  else
+    git show --stat --format='' "$sha" | sed '/^$/d' || true
+  fi
+}
+
+emit_capped_diff() {
+  local file="$1"
+  local size
+  size="$(wc -c < "$file" | tr -d ' ')"
+  echo '```diff'
+  if [[ "$size" -gt "$MAX_DIFF_BYTES" ]]; then
+    head -c "$MAX_DIFF_BYTES" "$file"
+    echo
+    echo "... (差分が ${size} バイトあるため ${MAX_DIFF_BYTES} バイトで切り詰めました。続きは git show / git diff で確認してください)"
+  else
+    cat "$file"
+  fi
+  echo '```'
+}
+
+# ---------------------------------------------------------------------------
+# 3. レビュー依頼ファイルの生成
+# ---------------------------------------------------------------------------
+
+BRANCH="$(git branch --show-current 2>/dev/null || true)"
+GENERATED_AT="$(date '+%Y-%m-%d %H:%M:%S %z')"
+
+{
+  echo "# Codex レビュー依頼"
+  echo
+  echo "- branch: ${BRANCH:-unknown}"
+  echo "- 対象判定: ${DETECTION:-作業ツリーのみ}"
+  echo "- 対象コミット数: ${#COMMITS[@]}"
+  if [[ "$SKIPPED_COUNT" -gt 0 ]]; then
+    echo "- レビュー済みのため除外: ${SKIPPED_COUNT} 件"
+  fi
+  echo "- 生成日時: ${GENERATED_AT}"
+  echo "- レビュー担当: codex (read-only)"
+  echo
+
+  if [[ ${#COMMITS[@]} -gt 0 ]]; then
+    echo "## 対象コミット（古い順）"
+    echo
+    for sha in "${COMMITS[@]}"; do
+      git log -1 --format='- `%h` %ad %an — %s' --date=format:'%Y-%m-%d %H:%M' "$sha"
+    done
+    echo
+
+    echo "## 変更ファイル"
+    echo
+    echo '```'
+    if [[ "$NET_DIFF_USABLE" -eq 1 ]]; then
+      git diff --stat "$NET_BASE" "$NET_HEAD" || true
+    else
+      for sha in "${COMMITS[@]}"; do
+        emit_commit_stat "$sha"
+      done
+    fi
+    echo '```'
+    echo
+
+    if [[ "$NET_DIFF_USABLE" -eq 1 ]]; then
+      echo "## 累積差分（${NET_BASE:0:9}..${NET_HEAD:0:9}）"
+      echo
+      git diff --no-ext-diff "$NET_BASE" "$NET_HEAD" > "$TMPDIR_WORK/net.diff" || true
+      emit_capped_diff "$TMPDIR_WORK/net.diff"
+      echo
+    else
+      echo "## 差分（コミット単位）"
+      echo
+      echo "> 選択コミットが連続していない、またはレンジ内にマージコミットが含まれるため、"
+      echo "> 累積差分ではなくコミット単位の差分を提示します（対象外の変更を混入させないため）。"
+      echo
+      for sha in "${COMMITS[@]}"; do
+        echo "### $(git log -1 --format='%h %s' "$sha")"
+        echo
+        emit_commit_diff "$sha"
+        echo
+      done
+    fi
+  fi
+
+  if [[ "$INCLUDE_DIRTY" -eq 1 ]]; then
+    echo "## 未コミットの作業ツリー差分"
+    echo
+    echo '```'
+    git status --short || true
+    echo '```'
+    echo
+    git diff --no-ext-diff HEAD > "$TMPDIR_WORK/dirty.diff" || true
+    emit_capped_diff "$TMPDIR_WORK/dirty.diff"
+    echo
+    untracked="$(git ls-files --others --exclude-standard 2>/dev/null || true)"
+    if [[ -n "$untracked" ]]; then
+      echo "### 未追跡ファイル"
+      echo
+      printf '%s\n' "$untracked" | sed 's/^/- /'
+      echo
+    fi
+  fi
+} > "$REQUEST_PATH"
+
+echo "レビュー依頼を生成しました: $REQUEST_PATH"
+
+# ---------------------------------------------------------------------------
+# 4. Codex プロンプトの構築
+# ---------------------------------------------------------------------------
+
+if [[ "$LANG_OUT" == "ja" ]]; then
+  OUTPUT_LANG_LINE="出力（summary / title / detail / evidence / proposedFix / verified / remainingRisks）はすべて日本語で書いてください。"
+else
+  OUTPUT_LANG_LINE="Write all output fields (summary / title / detail / evidence / proposedFix / verified / remainingRisks) in ${LANG_OUT}."
+fi
+
+# 最初に読ませるファイル。プロジェクト固有の基準があれば最優先にする。
+READ_FIRST=""
+n=1
+if [[ -f "$GUIDE_PATH" ]]; then
+  READ_FIRST+="${n}. ${GUIDE_PATH}  ← このプロジェクト固有のレビュー基準。最優先で従うこと。ここで指定されたファイルも読むこと"$'\n'
+  n=$(( n + 1 ))
+fi
+READ_FIRST+="${n}. リポジトリ直下と、変更されたファイルのあるディレクトリにある AGENTS.md / CLAUDE.md（存在するものだけ）"$'\n'
+n=$(( n + 1 ))
+READ_FIRST+="${n}. CONTRIBUTING.md などのコーディング規約・設計ドキュメント（存在し、変更に関係するものだけ）"
+
+PROMPT="$(cat <<EOM
+あなたはこのリポジトリのコードレビュー担当です。実装は別の担当（AI エージェントまたは人間）が行いました。
+あなたは指摘のみを行い、ファイルの修正は一切行わないでください（read-only で起動しています）。
+
+## 最初に読むファイル
+${READ_FIRST}
+
+## レビュー対象
+${REQUEST_PATH} に対象コミットと差分をまとめてあります。まずこれを読んでください。
+差分が切り詰められている場合は git show / git log -p / git diff で補完してください。
+判断に必要な周辺コード、呼び出し元、設計書・ドキュメントは自分で読んで確認してください。
+
+## 重点観点
+- コミットメッセージや実装意図をそのまま正としない。変更前のコードが現在のデータ・状態値で実際にどの分岐を通っていたかを確認する
+- 旧 ID / 旧 enum / 旧 value を新値へ置換する変更では、これまで無効だった分岐が新たに有効化されていないか
+- 追加・変更されたテストが実装者の解釈だけを固定していないか。仕様と逆の期待値なら blocker
+- コード変更に対応するドキュメントの更新が同じ作業単位で行われているか
+- 保守性、運用事故、データ整合性、権限・認証、回帰リスクを優先する
+
+## 出力
+指定された JSON スキーマに厳密に従って出力してください。
+${OUTPUT_LANG_LINE}
+- severity: blocker = merge 前に必ず修正すべき問題 / non-blocker = 改善提案
+- location: "path/to/file.ts:123" 形式。行が特定できない場合はファイルパスのみ
+- evidence: 実際に読んだコード・設計書の該当箇所を引用または要約する。推測で書かない
+- proposedFix: 具体的な修正方針。差分そのものは不要
+- confidence: 裏取りできた指摘のみ high。差分だけから推測した指摘は low
+指摘がない場合は findings を空配列にしてください。件数を埋めるための水増し指摘はしないでください。
+EOM
+)"
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  echo "--dry-run のため Codex は起動しません。"
+  printf '%s\n' "$PROMPT" > "$PROMPT_PATH"
+  echo "プロンプトを保存しました: $PROMPT_PATH"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Codex 実行
+# ---------------------------------------------------------------------------
+
+rm -f "$RESULT_PATH"
+
+CODEX_ARGS=(
+  exec
+  --sandbox read-only
+  --cd "$ROOT"
+  --color never
+  --skip-git-repo-check
+  # ローカルの ~/.codex/config.toml に起動失敗する MCP サーバーがあると
+  # codex exec がハングするため、レビュー実行時は MCP を無効化する。
+  -c "mcp_servers={}"
+  --output-schema "$SCHEMA_PATH"
+  --output-last-message "$RESULT_PATH"
+)
+[[ -n "$MODEL" ]] && CODEX_ARGS+=(--model "$MODEL")
+[[ -n "$EFFORT" ]] && CODEX_ARGS+=(-c "model_reasoning_effort=\"$EFFORT\"")
+
+echo "Codex を起動します（read-only）..."
+echo "  モデル    : ${MODEL:-(config.toml の既定)} [${MODEL_SOURCE}]"
+echo "  推論強度  : ${EFFORT:-(config.toml の既定)} [${EFFORT_SOURCE}]"
+set +e
+codex "${CODEX_ARGS[@]}" "$PROMPT" < /dev/null > "$LOG_PATH" 2>&1
+CODEX_STATUS=$?
+set -e
+
+if [[ "$CODEX_STATUS" -ne 0 ]]; then
+  echo "Codex の実行に失敗しました (exit ${CODEX_STATUS})。ログ: $LOG_PATH" >&2
+
+  # ログ全体を対象に単語を拾ってはならない。ログにはレビュー依頼の中身が
+  # そのまま含まれるため、資料に出てくる /login のような文字列で
+  # 認証エラーと誤判定し、無関係な対処を案内してしまう。
+  # Codex 自身が出す ERROR: 行だけを見る。
+  codex_errors="$(grep -E '^ERROR:' "$LOG_PATH" 2>/dev/null | sort -u)" || true
+
+  if [[ -n "$codex_errors" ]]; then
+    echo "Codex が報告したエラー:" >&2
+    printf '%s\n' "$codex_errors" | sed 's/^/  /' >&2
+  fi
+
+  if printf '%s' "$codex_errors" | grep -qiE 'usage limit|rate limit|quota'; then
+    echo "利用上限に達しています。ログに表示された時刻以降に再実行してください。" >&2
+    echo "記録はしていないため、対象コミットは次回そのままレビューされます。" >&2
+  elif printf '%s' "$codex_errors" | grep -qiE 'unauthorized|not authenticated|401|please (run )?codex login'; then
+    echo "認証エラーの可能性があります。codex login を実行してください。" >&2
+  fi
+
+  tail -30 "$LOG_PATH" >&2
+  exit "$CODEX_STATUS"
+fi
+
+if [[ ! -s "$RESULT_PATH" ]]; then
+  echo "Codex から結果が返りませんでした。ログ: $LOG_PATH" >&2
+  exit 1
+fi
+
+if ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$RESULT_PATH" 2>/dev/null; then
+  echo "Codex の出力が JSON として解析できません: $RESULT_PATH" >&2
+  exit 1
+fi
+
+read -r FINDINGS_COUNT BLOCKER_COUNT <<< "$(python3 - "$RESULT_PATH" <<'COUNT_EOF'
+import json, sys
+findings = json.load(open(sys.argv[1])).get("findings", [])
+blockers = sum(1 for x in findings if x.get("severity") == "blocker")
+print(len(findings), blockers)
+COUNT_EOF
+)"
+
+echo
+echo "レビュー結果: $RESULT_PATH"
+echo "実行ログ:     $LOG_PATH"
+echo "指摘: ${FINDINGS_COUNT}件 (blocker ${BLOCKER_COUNT}件 / non-blocker $(( FINDINGS_COUNT - BLOCKER_COUNT ))件)"
+
+# 今回明示されたモデル・推論強度を、次回以降の既定として記憶する。
+# 実行が成功した場合だけ記憶する。起動できないモデルを既定にすると、
+# 以降のレビューが黙って全部失敗するため。
+saved_model=""
+saved_effort=""
+[[ "$MODEL_SOURCE" == "今回の指定" ]] && saved_model="$MODEL"
+[[ "$EFFORT_SOURCE" == "今回の指定" ]] && saved_effort="$EFFORT"
+if [[ -n "$saved_model" || -n "$saved_effort" ]]; then
+  save_prefs "$saved_model" "$saved_effort"
+  echo "次回以降の既定として記憶しました:${saved_model:+ モデル=$saved_model}${saved_effort:+ 推論強度=$saved_effort}"
+  echo "戻す場合: $SELF_CMD --reset-defaults"
+fi
+
+# Codex の実行が成功しても、ここでは何も記録しない。
+# 記録するのはエージェントが指摘をユーザーへ提示し終えたあと (--complete) だけ。
+# ここで記録すると、提示前に中断された場合に、指摘が誰にも提示されないまま
+# 次回以降の対象から除外されてしまう。
+#
+# 提示後に使うコマンドを、対象 SHA を埋めた形でそのまま出す。
+# 対象を SHA で明示するので、並行実行や別セッションがあっても取り違えようがない。
+if [[ ${#COMMITS[@]} -gt 0 ]]; then
+  # レビューを通した SHA を「提示待ち」として積む。--complete はここに載った
+  # SHA しか受け付けない。これが無いと、レビューしていないコミットを手入力で
+  # 記録でき、以後の対象から黙って外れてレビュー漏れになる。
+  # 積むだけでは除外されない (除外は --complete で reviewed に移ってから)。
+  printf '%s\n' "${COMMITS[@]}" \
+    | python3 "$STATE_SCRIPT" pend "$STATE_PATH" --session "$SESSION_ID" >/dev/null
+  echo "指摘をユーザーへ提示したら次を実行してください:"
+  echo "  $SELF_CMD --complete --findings $FINDINGS_COUNT --blockers $BLOCKER_COUNT ${COMMITS[*]}"
+else
+  # --dirty だけの実行。記録する対象コミットが無いので --complete も要らない。
+  echo "対象コミットが無いため、レビュー済みの記録は不要です。"
+fi

@@ -1,0 +1,16 @@
+{
+  "name": "codex-review",
+  "owner": {
+    "name": "codex-review"
+  },
+  "metadata": {
+    "description": "Codex CLI による独立コードレビューのスキル codex-review を配布するマーケットプレイス"
+  },
+  "plugins": [
+    {
+      "name": "codex-review",
+      "source": "./",
+      "description": "未レビューのコミットを Codex CLI に read-only でレビューさせ、各指摘を実コードで検証して修正案を提示するスキル"
+    }
+  ]
+}
